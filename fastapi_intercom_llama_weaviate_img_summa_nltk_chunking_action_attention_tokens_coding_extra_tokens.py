@@ -3,7 +3,6 @@ import threading
 import os
 import aiosqlite
 import logging
-import numpy as np
 import base64
 import queue
 import uuid
@@ -13,31 +12,25 @@ import io
 import sys
 import random
 import asyncio
-import weaviate
 import re
-from concurrent.futures import ThreadPoolExecutor
-from summa import summarizer
-from textblob import TextBlob
-from weaviate.util import generate_uuid5
-from PIL import Image, ImageTk
-from llama_cpp import Llama
-from nltk import pos_tag, word_tokenize
-from nltk.corpus import wordnet as wn
+import weaviate
 import nltk
 import json
-from os import path
 import weaviate
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi import Security, Depends, HTTPException
 from fastapi.security.api_key import APIKeyHeader
-import re
-import logging
+from concurrent.futures import ThreadPoolExecutor
+from summa import summarizer
+from textblob import TextBlob
+from PIL import Image, ImageTk
+from llama_cpp import Llama
 from nltk import pos_tag, word_tokenize
+from nltk.corpus import wordnet as wn
+from os import path
 from collections import Counter
-
-
 bundle_dir = path.abspath(path.dirname(__file__))
 path_to_config = path.join(bundle_dir, 'config.json')
 model_path = path.join(bundle_dir, 'llama-2-7b-chat.ggmlv3.q8_0.bin')
@@ -155,6 +148,8 @@ llm = Llama(
     n_gpu_layers=-1,
     n_ctx=3900,
 )
+
+
 def is_code_like(chunk):
     code_patterns = r'\b(def|class|import|if|else|for|while|return|function|var|let|const|print)\b|[\{\}\(\)=><\+\-\*/]'
     return bool(re.search(code_patterns, chunk))
