@@ -13,7 +13,7 @@ The Llama Generate API provides an interface for processing text inputs using th
 The base URL for the API is:
 
 ```
-https://magnetic-poodle-apparent.ngrok-free.app
+https://yourngorkhere
 ```
 
 ## Authentication
