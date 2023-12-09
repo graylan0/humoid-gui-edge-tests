@@ -14,6 +14,7 @@ import sys
 import random
 import asyncio
 import weaviate
+import re
 from concurrent.futures import ThreadPoolExecutor
 from summa import summarizer
 from textblob import TextBlob
@@ -31,6 +32,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi import Security, Depends, HTTPException
 from fastapi.security.api_key import APIKeyHeader
+import re
+import logging
+from nltk import pos_tag, word_tokenize
+from collections import Counter
 
 
 bundle_dir = path.abspath(path.dirname(__file__))
@@ -150,90 +155,75 @@ llm = Llama(
     n_gpu_layers=-1,
     n_ctx=3900,
 )
+def is_code_like(chunk):
+    code_patterns = r'\b(def|class|import|if|else|for|while|return|function|var|let|const|print)\b|[\{\}\(\)=><\+\-\*/]'
+    return bool(re.search(code_patterns, chunk))
 
+def determine_token(chunk, max_words_to_check=100):
+    if not chunk:
+        return "[attention]"
+
+    if is_code_like(chunk):
+        return "[code]"
+
+    words = word_tokenize(chunk)[:max_words_to_check]
+    tagged_words = pos_tag(words)
+
+    pos_counts = Counter(tag[:2] for _, tag in tagged_words)
+    most_common_pos, _ = pos_counts.most_common(1)[0]
+
+    if most_common_pos == 'VB':
+        return "[action]"
+    elif most_common_pos == 'NN':
+        return "[subject]"
+    elif most_common_pos in ['JJ', 'RB']:
+        return "[description]"
+    else:
+        return "[general]"
+
+def find_max_overlap(chunk, next_chunk):
+    max_overlap = min(len(chunk), 400)
+    return next((overlap for overlap in range(max_overlap, 0, -1) if chunk.endswith(next_chunk[:overlap])), 0)
+
+def truncate_text(text, max_words=25):
+    return ' '.join(text.split()[:max_words])
+
+def fetch_relevant_info(chunk, weaviate_client):
+    if not weaviate_client:
+        logger.error("Weaviate client is not provided.")
+        return ""
+
+    query = f"""
+    {{
+        Get {{
+            InteractionHistory(nearText: {{
+                concepts: ["{chunk}"],
+                certainty: 0.7
+            }}) {{
+                user_message
+                ai_response
+                .with_limit(1)
+            }}
+        }}
+    }}
+    """
+    try:
+        response = weaviate_client.query.raw(query)
+        if response and 'data' in response and 'Get' in response['data'] and 'InteractionHistory' in response['data']['Get']:
+            interaction = response['data']['Get']['InteractionHistory'][0]
+            return f"{truncate_text(interaction['user_message'])} {truncate_text(interaction['ai_response'])}"
+        else:
+            logger.error("Weaviate client returned no relevant data.")
+            return ""
+    except Exception as e:
+        logger.error(f"Weaviate query failed: {e}")
+        return ""
 
 def llama_generate(prompt, weaviate_client=None):
     config = load_config()
     max_tokens = config.get('MAX_TOKENS', 3999)
-    chunk_size = config.get('CHUNK_SIZE', 1250) 
+    chunk_size = config.get('CHUNK_SIZE', 1250)
     try:
-        
-        def find_max_overlap(chunk, next_chunk):
-            max_overlap = min(len(chunk), 400)
-            for overlap in range(max_overlap, 0, -1):
-                if chunk.endswith(next_chunk[:overlap]):
-                    return overlap
-            return 0
-
-
-        def determine_token(chunk):
-
-            words = word_tokenize(chunk)
-            tagged_words = pos_tag(words)
-            verbs = [word for word, tag in tagged_words if tag.startswith('VB')]
-
-            if verbs:
-                return "[action]"
-            else:
-                return "[attention]"
-
-
-        def fetch_relevant_info(chunk, weaviate_client):
-
-            def truncate_text(text, max_words=25):
-                words = text.split()
-                return ' '.join(words[:max_words])
-
-            if weaviate_client:
-                query = f"""
-                {{
-                    Get {{
-                        InteractionHistory(nearText: {{
-                            concepts: ["{chunk}"],
-                            certainty: 0.7
-                        }}) {{
-                            user_message
-                            ai_response
-                            .with_limit(1)
-                        }}
-                    }}
-                }}
-                """
-                response = weaviate_client.query.raw(query)
-
-                if 'data' in response and 'Get' in response['data'] and 'InteractionHistory' in response['data']                ['Get']:
-                    interaction = response['data']['Get']['InteractionHistory'][0]
-                    user_message = truncate_text(interaction['user_message'])
-                    ai_response = truncate_text(interaction['ai_response'])
-                    return f"{user_message} {ai_response}"
-                else:
-                    return ""
-            return ""
-
-
-        def tokenize_and_generate(chunk, token):
-           inputs = llm(f"[{token}] {chunk}", max_tokens=min(max_tokens, chunk_size))
-
-           if inputs is None:
-               logger.error(f"Llama model returned None for input: {chunk}")
-               return None
-
-           if not isinstance(inputs, dict):
-               logger.error(f"Output from Llama is not a dictionary: {type(inputs)}")
-               return None
-
-           choices = inputs.get('choices', [])
-           if not choices or not isinstance(choices[0], dict):
-               logger.error(f"No valid choices in Llama output")
-               return None
-
-           output = choices[0].get('text', '')
-           if not output:
-               logger.error(f"No text found in Llama output")
-               return None
-
-           return output
-
         prompt_chunks = [prompt[i:i + chunk_size] for i in range(0, len(prompt), chunk_size)]
         responses = []
         last_output = ""
@@ -241,10 +231,12 @@ def llama_generate(prompt, weaviate_client=None):
         for i, chunk in enumerate(prompt_chunks):
             relevant_info = fetch_relevant_info(chunk, weaviate_client)
             combined_chunk = f"{relevant_info} {chunk}"
-            
-
             token = determine_token(combined_chunk)
-            output = tokenize_and_generate(combined_chunk, token)
+            output = tokenize_and_generate(combined_chunk, token, max_tokens, chunk_size)
+
+            if output is None:
+                logger.error(f"Failed to generate output for chunk: {combined_chunk}")
+                continue
 
             if i > 0 and last_output:
                 overlap = find_max_overlap(last_output, output)
@@ -254,9 +246,26 @@ def llama_generate(prompt, weaviate_client=None):
             last_output = output
 
         final_response = ''.join(responses)
-        return final_response
+        return final_response if final_response else None
     except Exception as e:
         logger.error(f"Error in llama_generate: {e}")
+        return None
+
+def tokenize_and_generate(chunk, token, max_tokens, chunk_size):
+    try:
+        inputs = llm(f"[{token}] {chunk}", max_tokens=min(max_tokens, chunk_size))
+        if inputs is None or not isinstance(inputs, dict):
+            logger.error(f"Llama model returned invalid output for input: {chunk}")
+            return None
+
+        choices = inputs.get('choices', [])
+        if not choices or not isinstance(choices[0], dict):
+            logger.error("No valid choices in Llama output")
+            return None
+
+        return choices[0].get('text', '')
+    except Exception as e:
+        logger.error(f"Error in tokenize_and_generate: {e}")
         return None
 
 
